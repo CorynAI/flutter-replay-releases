@@ -1,0 +1,10 @@
+name: coryn_replay_workspace
+publish_to: none
+
+environment:
+  sdk: ^3.13.0
+
+workspace:
+  - packages/coryn_replay
+  - packages/coryn_replay_http
+  - packages/coryn_replay_dio
