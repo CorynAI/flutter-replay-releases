@@ -11,7 +11,7 @@ other platforms every call is a no-op.
 
 ## Install
 
-Add the packages as git dependencies at a release tag (the latest is `v0.1.0`), with the same tag for all of them:
+Add the packages as git dependencies at a release tag (the latest is `v0.2.0`), with the same tag for all of them:
 
 ```yaml
 dependencies:
@@ -19,7 +19,7 @@ dependencies:
     git:
       url: https://github.com/CorynAI/flutter-replay-releases.git
       path: packages/coryn_replay
-      ref: v0.1.0
+      ref: v0.2.0
 ```
 
 The Android app also needs the Coryn Maven repository, `minSdk` 26 or higher and `compileSdk` 36 or higher; see

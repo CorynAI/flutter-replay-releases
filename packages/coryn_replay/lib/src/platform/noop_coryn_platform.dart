@@ -24,7 +24,7 @@ final class NoopCorynPlatform implements CorynPlatform {
   Future<void> stopRecording(String? reason) async {}
 
   @override
-  Future<int> registerScreen(String name, Map<String, Object>? arguments) async => 0;
+  Future<int> registerScreen(String name, bool isDialog, Map<String, Object>? arguments) async => 0;
 
   @override
   Future<void> unregisterScreen(int handle) async {}
@@ -39,6 +39,15 @@ final class NoopCorynPlatform implements CorynPlatform {
   Future<void> showToast(String text, bool isLong) async {}
 
   @override
+  Future<void> setUserId(String? userId) async {}
+
+  @override
+  Future<void> sendScreenText(int requestId, List<List<Object>> items) async {}
+
+  @override
+  Future<void> sendTouch(int action, int actionPointer, List<num> pointers, int eventTimeMs) async {}
+
+  @override
   Future<bool> sendStateBatch(Uint8List batch) async => true;
 
   @override
@@ -49,4 +58,7 @@ final class NoopCorynPlatform implements CorynPlatform {
 
   @override
   Future<Map<String, Object?>> debugStats() async => const <String, Object?>{};
+
+  @override
+  Future<void> reportFailure(String reason, String? type, String? stacktrace) async {}
 }

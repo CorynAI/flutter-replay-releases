@@ -14,15 +14,25 @@ import 'coryn_root.dart';
 /// * Every active [SnapshotWidget] (the zoom page transition uses one), at its nearest enclosing repaint boundary.
 ///
 /// Everything a hidden [CorynHide] shows in the Overlay through an `OverlayPortal` is masked at its nearest repaint
-/// boundary too.
+/// boundary too; the selection handles and toolbar of a masked text field are left out.
 Map<Layer, Rect> collectHiddenLayers(RenderCorynRoot root, CorynCaptureOptions options) {
   final hidden = <Layer, Rect>{};
   for (final hide in RenderCorynHide.attachedHides) {
     final layer = hide.captureLayer;
     if (hide.hide && layer != null) hidden[layer] = hide.maskRect;
   }
+  final rootLayer = root.captureLayer;
+  if (rootLayer != null && _isInHiddenHide(root)) hidden[rootLayer] = root.paintBounds;
   _collectElementMasks(root, hidden, options.maskObscuredText);
   return hidden;
+}
+
+/// A hidden [CorynHide] around the root masks all of it: the masker starts at the root and never sees ancestor layers.
+bool _isInHiddenHide(RenderCorynRoot root) {
+  for (RenderObject? parent = root.parent; parent != null; parent = parent.parent) {
+    if (parent is RenderCorynHide && parent.hide) return true;
+  }
+  return false;
 }
 
 /// One walk over the whole element tree finds snapshots, obscured text fields and content that a hidden [CorynHide]
@@ -40,14 +50,24 @@ Map<Layer, Rect> collectHiddenLayers(RenderCorynRoot root, CorynCaptureOptions o
 /// render-object element ancestor was moved out of the hide's layer: an `OverlayPortal` child (tooltips, `MenuAnchor`
 /// and `DropdownMenu` menus, `Autocomplete` options, slider value indicators) is a render child of the Overlay. It is
 /// masked at its nearest repaint boundary, usually the whole Overlay, while it exists.
+///
+/// The selection handles and toolbar of a masked text field (obscured, or below a hidden [CorynHide]) are painted in
+/// the Overlay by followers of the field's layer links, at positions that reveal the text's length. Their follower
+/// layers are left out of the capture (an empty mask): a black box at their position would still reveal it. The
+/// selection magnifier ([RawMagnifier], Material and Cupertino) is no follower and has no layer of its own, so while a
+/// masked field exists, a magnifier masks the nearest repaint boundary of its whole Overlay.
 void _collectElementMasks(RenderCorynRoot root, Map<Layer, Rect> hidden, bool maskObscuredText) {
   final rootElement = WidgetsBinding.instance.rootElement;
   if (rootElement == null) return;
+  final maskedLinks = <LayerLink>{};
+  final followers = <RenderFollowerLayer>[];
+  final magnifiers = <Element>[];
   RenderObject? parentRenderObject;
   var isInHiddenHide = false;
   void visit(Element element) {
     final outerParentRenderObject = parentRenderObject;
     final wasInHiddenHide = isInHiddenHide;
+    if (element.widget is RawMagnifier) magnifiers.add(element);
     if (element is RenderObjectElement) {
       final widget = element.widget;
       final renderObject = element.renderObject;
@@ -56,8 +76,12 @@ void _collectElementMasks(RenderCorynRoot root, Map<Layer, Rect> hidden, bool ma
       if (widget is SnapshotWidget) {
         final isImageDrawn = widget.controller.allowSnapshotting || !_isChildPaintedLive(renderObject);
         if (isImageDrawn) _hideNearestBoundary(renderObject.parent, root, hidden);
-      } else if (maskObscuredText && renderObject is RenderEditable && renderObject.obscureText) {
-        _hideNearestBoundary(renderObject.parent, root, hidden);
+      } else if (renderObject is RenderEditable) {
+        final isObscuredMasked = maskObscuredText && renderObject.obscureText;
+        if (isObscuredMasked) _hideNearestBoundary(renderObject.parent, root, hidden);
+        if (isObscuredMasked || isInHiddenHide) _addSelectionLinks(renderObject, maskedLinks);
+      } else if (renderObject is RenderFollowerLayer) {
+        followers.add(renderObject);
       }
       if (renderObject is RenderCorynHide && renderObject.hide) isInHiddenHide = true;
       parentRenderObject = renderObject;
@@ -68,6 +92,29 @@ void _collectElementMasks(RenderCorynRoot root, Map<Layer, Rect> hidden, bool ma
   }
 
   rootElement.visitChildren(visit);
+  if (maskedLinks.isEmpty) return;
+  for (final magnifier in magnifiers) {
+    final overlay = magnifier.findAncestorStateOfType<OverlayState>()?.context.findRenderObject();
+    _hideNearestBoundary(overlay ?? magnifier.findRenderObject(), root, hidden);
+  }
+  for (final follower in followers) {
+    // ignore: invalid_use_of_protected_member
+    final layer = follower.layer;
+    if (layer != null && maskedLinks.contains(follower.link)) hidden[layer] = Rect.zero;
+  }
+}
+
+/// The handle links of [editable] and the toolbar link of its `EditableText`, the nearest leader above it.
+void _addSelectionLinks(RenderEditable editable, Set<LayerLink> links) {
+  links
+    ..add(editable.startHandleLayerLink)
+    ..add(editable.endHandleLayerLink);
+  for (RenderObject? parent = editable.parent; parent != null; parent = parent.parent) {
+    if (parent is RenderLeaderLayer) {
+      links.add(parent.link);
+      return;
+    }
+  }
 }
 
 /// Masks the nearest repaint-boundary layer from [start] upwards (nothing before its first paint).

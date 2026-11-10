@@ -8,6 +8,7 @@ import 'package:flutter/scheduler.dart';
 import 'package:flutter/widgets.dart' show WidgetsBinding;
 
 import '../configuration.dart';
+import '../errors/coryn_failure_reporter.dart';
 import '../platform/coryn_platform.dart';
 import 'coryn_capture_stats.dart';
 import 'coryn_frame_message.dart';
@@ -26,10 +27,10 @@ import 'coryn_scene_masker.dart';
 /// Nothing is captured before the engine rasterized its first frame: Impeller's OpenGL ES backend can fault on an image
 /// snapshot taken that early (a new engine attaching to a running capture after an in-process relaunch).
 ///
-/// Pacing mirrors the native capture loop, whose target rate is effectively "as fast as the pipeline allows":
+/// Pacing mirrors the native capture loop, whose target rate comes from the backend feature flags:
 /// * A capture happens only when a frame was produced since the last *accepted* capture (or native asked for one),
 ///   when native is ready (it signals readiness after compressing the previous frame and the encoder's pause), and at
-///   most once per [CorynCaptureOptions.minCaptureInterval]. Busy, rejected and failed captures keep the frame dirty.
+///   most once per native frame interval (1 / target rate). Busy, rejected and failed captures keep the frame dirty.
 ///   When a capture is due and no frame is coming (native asked, a ready signal arrived after the last frame, the last
 ///   change came inside the interval), the scheduler asks for a frame.
 /// * Between captures (nothing changed, a change waiting for the interval, the app paused) a cheap "unchanged" health
@@ -39,13 +40,14 @@ import 'coryn_scene_masker.dart';
 ///   the encoder, when native itself decides); after a busy, rejected or failed capture native health lapses until a
 ///   capture is accepted. Nothing vouches before the first capture of a recording, so native gives that one 4 s.
 final class CorynCaptureScheduler {
-  CorynCaptureScheduler(this._platform);
+  CorynCaptureScheduler(this._platform, this._failures);
 
   /// Native captures fit the screen into 768 x 1024 (`CorynUICaptureConstants`).
   static const double targetWidth = 768;
   static const double targetHeight = 1024;
 
   final CorynPlatform _platform;
+  final CorynFailureReporter _failures;
   final CorynCaptureStats stats = CorynCaptureStats();
   final Stopwatch _clock = Stopwatch()..start();
 
@@ -84,13 +86,19 @@ final class CorynCaptureScheduler {
   int _geometryRevision = 0;
   int? _invalidatedAtFrame;
   bool _isInFlight = false;
+  bool _isSurfaceLive = false;
   bool _isPaused = false;
-  bool _isFailureReported = false;
   Duration? _lastCaptureAt;
   Duration? _lastHealthAt;
 
   /// Whether native currently asks for captures.
   bool get isCapturing => _targetFps != null;
+
+  /// The captured root, if attached.
+  RenderCorynRoot? get root => _root;
+
+  /// Frames produced so far; a new value means the screen may have changed.
+  int get frameCount => _frameCount;
 
   /// The outermost root is captured: a `CorynRoot` nested in the captured one (for example in a page or package) is
   /// ignored, so it neither crops the capture nor stops it when it leaves.
@@ -116,24 +124,34 @@ final class CorynCaptureScheduler {
   /// Counts produced frames and captures the frame when due. Called from a persistent frame callback after the frame
   /// was composited; the capture's synchronous part (masking, scene, rasterization request) runs right here.
   void onFrame() {
-    _frameCount++;
-    final root = _root;
-    if (root == null || !_isCaptureDue(root)) return;
-    _invalidatedAtFrame = null;
-    unawaited(_captureFrame(root, now()));
+    try {
+      _frameCount++;
+      final root = _root;
+      if (root == null || !_isCaptureDue(root)) return;
+      _invalidatedAtFrame = null;
+      unawaited(_captureFrame(root, now()));
+    } catch (error, stack) {
+      _failures.reportFailure('capture: frame callback', error, stack);
+    }
   }
 
   /// Whether the last composited frame may be captured now.
   bool _isCaptureDue(RenderCorynRoot root) {
-    if (_isInFlight || _isPaused || _targetFps == null || !_isNativeReady) return false;
-    if (!root.attached || !root.hasSize || !isFirstFrameRasterized()) return false;
+    final targetFps = _targetFps;
+    if (_isInFlight || _isPaused || targetFps == null || !_isNativeReady) return false;
+    if (!root.attached || !root.hasSize || !_isSurfaceLive || !isFirstFrameRasterized()) return false;
     final isDirty = _needsCapture || _frameCount != _capturedFrame;
     if (!isDirty) return false;
     final lastCaptureAt = _lastCaptureAt;
-    final isThrottled = lastCaptureAt != null && now() - lastCaptureAt < options.minCaptureInterval;
+    final isThrottled = lastCaptureAt != null && now() - lastCaptureAt < _captureInterval(targetFps);
     final invalidatedAtFrame = _invalidatedAtFrame;
     final isAwaitingFrame = invalidatedAtFrame != null && _frameCount <= invalidatedAtFrame;
     return !isThrottled && !isAwaitingFrame;
+  }
+
+  /// Native asks for at most [targetFps] captures per second, the rate set by the backend.
+  static Duration _captureInterval(double targetFps) {
+    return Duration(microseconds: (Duration.microsecondsPerSecond / targetFps).round());
   }
 
   /// A capture is due but happens only in a frame: ask for one (nothing if a frame is already scheduled).
@@ -142,24 +160,25 @@ final class CorynCaptureScheduler {
     if (root != null && _isCaptureDue(root)) SchedulerBinding.instance.scheduleFrame();
   }
 
-  /// Captures follow [CorynCaptureOptions.minCaptureInterval] at event time; the periodic timer runs at that interval
-  /// for trailing frames, but at least every [healthInterval] and at most every [minTimerInterval]. Native also calls
-  /// start to change the rate of a running capture (feature flags refreshed); pacing does not depend on the rate, so
-  /// such a call keeps the run, its in-flight capture and what native already recorded.
+  /// Captures follow the native frame interval at event time; the periodic timer runs at that interval for trailing
+  /// frames, but at least every [healthInterval] and at most every [minTimerInterval]. Native also calls start to
+  /// change the rate of a running capture (feature flags refreshed); the new rate paces the next capture and the timer,
+  /// and such a call keeps the run, its in-flight capture and what native already recorded.
   void start(double targetFps) {
     final isRunning = _targetFps != null;
     _targetFps = targetFps;
-    if (isRunning) return;
-    _runId++;
-    _needsCapture = true;
-    _isNativeReady = true;
-    _isLastCaptureAccepted = false;
-    var interval = options.minCaptureInterval;
+    var interval = _captureInterval(targetFps);
     if (interval > healthInterval) interval = healthInterval;
     if (interval < minTimerInterval) interval = minTimerInterval;
     _timer?.cancel();
     _timer = Timer.periodic(interval, (_) => tick());
     scheduleMicrotask(tick);
+    if (isRunning) return;
+    _runId++;
+    _lastCaptureAt = null;
+    _needsCapture = true;
+    _isNativeReady = true;
+    _isLastCaptureAccepted = false;
   }
 
   void stop() {
@@ -192,22 +211,33 @@ final class CorynCaptureScheduler {
     if (!value) _needsCapture = true;
   }
 
+  /// Gates snapshots on the renderer's reported display state; native closes it before the surface is destroyed. A late
+  /// display callback can reopen it after a loss: strict readiness would need engine surface generations.
+  set isSurfaceLive(bool value) {
+    _isSurfaceLive = value;
+    if (value) _needsCapture = true;
+  }
+
   /// Periodic tick: asks for a frame when a capture is due (it is taken in that frame), otherwise sends a health
   /// message while the last capture was accepted, also while the app is paused (native's own capture reports "no
   /// views" in the background). Public for tests and benchmarks.
   Future<void> tick() async {
-    if (_isInFlight || _targetFps == null) return;
-    final root = _root;
-    if (root == null || !root.attached || !root.hasSize) return;
-    if (_isCaptureDue(root)) {
-      SchedulerBinding.instance.scheduleFrame();
-      return;
+    try {
+      if (_isInFlight || _targetFps == null) return;
+      final root = _root;
+      if (root == null || !root.attached || !root.hasSize) return;
+      if (_isCaptureDue(root)) {
+        SchedulerBinding.instance.scheduleFrame();
+        return;
+      }
+      if (!_isLastCaptureAccepted) return;
+      final time = now();
+      final lastHealthAt = _lastHealthAt;
+      final isHealthDue = lastHealthAt == null || time - lastHealthAt >= healthInterval;
+      if (isHealthDue) await _reportUnchanged(time);
+    } catch (error, stack) {
+      _failures.reportFailure('capture: tick', error, stack);
     }
-    if (!_isLastCaptureAccepted) return;
-    final time = now();
-    final lastHealthAt = _lastHealthAt;
-    final isHealthDue = lastHealthAt == null || time - lastHealthAt >= healthInterval;
-    if (isHealthDue) await _reportUnchanged(time);
   }
 
   /// Readiness is consumed before submitting. Native may signal ready (on another channel) before the frame reply
@@ -221,18 +251,7 @@ final class CorynCaptureScheduler {
     _isNativeReady = false;
     try {
       final frame = _frameCount;
-      final CorynFrameResult? result;
-      try {
-        result = await _capture(root);
-      } catch (error, stack) {
-        if (runId != _runId) return;
-        _needsCapture = true;
-        _isNativeReady = true;
-        _isLastCaptureAccepted = false;
-        stats.rejectedCaptures++;
-        _reportFailureOnce('capture failed: $error', stack);
-        return;
-      }
+      final result = await _capture(root);
       if (runId != _runId) return;
       final wasReadySignalled = _readySignals != readySignalsBefore;
       _isLastCaptureAccepted = result == CorynFrameResult.accepted;
@@ -248,6 +267,12 @@ final class CorynCaptureScheduler {
           _needsCapture = true;
           _isNativeReady = true;
       }
+    } catch (error, stack) {
+      _failures.reportFailure('capture: completion', error, stack);
+      if (runId != _runId) return;
+      _needsCapture = true;
+      _isNativeReady = true;
+      _isLastCaptureAccepted = false;
     } finally {
       _isInFlight = false;
     }
@@ -263,82 +288,96 @@ final class CorynCaptureScheduler {
       final isRecorded = await _platform.sendUiUnchanged();
       stats.unchangedTicks++;
       if (!isRecorded && wasNativeReady) _needsCapture = true;
+    } catch (error, stack) {
+      _failures.reportFailure('capture: unchanged health', error, stack);
     } finally {
       _isInFlight = false;
     }
   }
 
+  /// A failing stage (scene, read-back, frame channel) is reported under its own reason and rejects the capture: the
+  /// frame stays dirty and native ready.
   Future<CorynFrameResult?> _capture(RenderCorynRoot root) async {
-    final total = Stopwatch()..start();
-    // The image belongs to the geometry of this moment; it is dropped if the geometry changes before it is sent.
-    final geometryRevision = _geometryRevision;
-    final view = root.flutterView;
-    final devicePixelRatio = view.devicePixelRatio;
-    final pixelRatio = devicePixelRatio / _scaleFactor(view);
-    final size = root.size;
-    final imageWidth = math.max(1, (size.width * pixelRatio).round());
-    final imageHeight = math.max(1, (size.height * pixelRatio).round());
-    final rootOffset = root.localToGlobal(Offset.zero) * devicePixelRatio;
-    final viewSize = view.physicalSize;
-
-    final walk = Stopwatch()..start();
-    final hidden = collectHiddenLayers(root, options);
-    final masked = CorynSceneMasker(hidden).build(root.captureLayer, pixelRatio, imageWidth, imageHeight);
-    walk.stop();
-    switch (masked) {
-      case CorynMaskedSceneNotPainted():
-        return null;
-      case CorynMaskedSceneRejected(:final reason):
-        stats.rejectedCaptures++;
-        _reportFailureOnce(reason);
-        return null;
-      case CorynMaskedImage():
-        break;
-    }
-    final image = masked.image;
-    final readback = Stopwatch()..start();
-    final ByteData? pixels;
+    var stage = 'scene';
     try {
-      pixels = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
-    } finally {
-      image.dispose();
-    }
-    readback.stop();
-    if (pixels == null) {
+      final total = Stopwatch()..start();
+      // The image belongs to the geometry of this moment; it is dropped if the geometry changes before it is sent.
+      final geometryRevision = _geometryRevision;
+      final view = root.flutterView;
+      final devicePixelRatio = view.devicePixelRatio;
+      final pixelRatio = devicePixelRatio / _scaleFactor(view);
+      final size = root.size;
+      final imageWidth = math.max(1, (size.width * pixelRatio).round());
+      final imageHeight = math.max(1, (size.height * pixelRatio).round());
+      final rootOffset = root.localToGlobal(Offset.zero) * devicePixelRatio;
+      final viewSize = view.physicalSize;
+
+      final walk = Stopwatch()..start();
+      final hidden = collectHiddenLayers(root, options);
+      final masked = CorynSceneMasker(hidden).build(root.captureLayer, pixelRatio, imageWidth, imageHeight);
+      walk.stop();
+      switch (masked) {
+        case CorynMaskedSceneNotPainted():
+          return null;
+        case CorynMaskedSceneRejected(:final reason):
+          stats.rejectedCaptures++;
+          _failures.reportFailure('capture: $reason', null, null);
+          return null;
+        case CorynMaskedImage():
+          break;
+      }
+      stage = 'read-back';
+      final image = masked.image;
+      final readback = Stopwatch()..start();
+      final ByteData? pixels;
+      try {
+        pixels = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
+      } finally {
+        image.dispose();
+      }
+      readback.stop();
+      if (pixels == null) {
+        stats.rejectedCaptures++;
+        _failures.reportFailure('capture: read-back returned no pixels', null, null);
+        return null;
+      }
+      final isGeometryChanged = geometryRevision != _geometryRevision;
+      if (isGeometryChanged) return null;
+      final encode = Stopwatch()..start();
+      final header = CorynFrameMessage.header(
+        imageWidth: imageWidth,
+        imageHeight: imageHeight,
+        rootLeft: rootOffset.dx.round(),
+        rootTop: rootOffset.dy.round(),
+        rootWidth: (size.width * devicePixelRatio).round(),
+        rootHeight: (size.height * devicePixelRatio).round(),
+        viewWidth: viewSize.width.round(),
+        viewHeight: viewSize.height.round(),
+        timePassedMs: total.elapsedMilliseconds,
+        geometryRevision: geometryRevision,
+      );
+      encode.stop();
+      stage = 'frame channel';
+      final send = Stopwatch()..start();
+      final result = await _platform.sendFrame(header, pixels);
+      send.stop();
+      total.stop();
+      stats.record(
+        result: result,
+        hiddenLayers: hidden.length,
+        bytes: header.length + pixels.lengthInBytes,
+        walk: walk.elapsed,
+        readback: readback.elapsed,
+        encode: encode.elapsed,
+        send: send.elapsed,
+        total: total.elapsed,
+      );
+      return result;
+    } catch (error, stack) {
       stats.rejectedCaptures++;
+      _failures.reportFailure('capture: $stage', error, stack);
       return null;
     }
-    final isGeometryChanged = geometryRevision != _geometryRevision;
-    if (isGeometryChanged) return null;
-    final encode = Stopwatch()..start();
-    final header = CorynFrameMessage.header(
-      imageWidth: imageWidth,
-      imageHeight: imageHeight,
-      rootLeft: rootOffset.dx.round(),
-      rootTop: rootOffset.dy.round(),
-      rootWidth: (size.width * devicePixelRatio).round(),
-      rootHeight: (size.height * devicePixelRatio).round(),
-      viewWidth: viewSize.width.round(),
-      viewHeight: viewSize.height.round(),
-      timePassedMs: total.elapsedMilliseconds,
-      geometryRevision: geometryRevision,
-    );
-    encode.stop();
-    final send = Stopwatch()..start();
-    final result = await _platform.sendFrame(header, pixels);
-    send.stop();
-    total.stop();
-    stats.record(
-      result: result,
-      hiddenLayers: hidden.length,
-      bytes: header.length + pixels.lengthInBytes,
-      walk: walk.elapsed,
-      readback: readback.elapsed,
-      encode: encode.elapsed,
-      send: send.elapsed,
-      total: total.elapsed,
-    );
-    return result;
   }
 
   /// Same fit as native captures: the display is scaled down to fit 768 x 1024.
@@ -347,19 +386,5 @@ final class CorynCaptureScheduler {
     final hasDisplaySize = displaySize.width > 0 && displaySize.height > 0;
     final size = hasDisplaySize ? displaySize : view.physicalSize;
     return math.max(1, math.max(size.width / targetWidth, size.height / targetHeight));
-  }
-
-  void _reportFailureOnce(String reason, [StackTrace? stack]) {
-    if (_isFailureReported) return;
-    _isFailureReported = true;
-    FlutterError.reportError(
-      FlutterErrorDetails(
-        exception: StateError('Coryn UI capture rejected: $reason'),
-        stack: stack,
-        library: 'coryn_replay',
-        context: ErrorDescription('while capturing a Coryn UI frame'),
-        silent: kReleaseMode,
-      ),
-    );
   }
 }

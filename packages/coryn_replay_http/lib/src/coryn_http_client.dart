@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:coryn_replay/coryn_replay.dart';
+import 'package:coryn_replay/coryn_replay_internal.dart';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 /// Called with every report; return a modified copy to redact it further, or `null` to skip it.
@@ -43,6 +45,7 @@ class CorynHttpClient extends http.BaseClient {
   final CorynApiRequestBuilder _builder;
   final void Function(CorynApiRequest request) _report;
   final CorynApiRequestTransform? transform;
+  bool _isCallbackFailureReported = false;
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
@@ -68,6 +71,10 @@ class CorynHttpClient extends http.BaseClient {
       rethrow;
     }
     final duration = stopwatch.elapsed;
+    // The report may be built after the app consumed the body: it records the headers as sent (finalized by the inner
+    // client, which sets a multipart boundary) and received.
+    final requestHeaders = _entries(request.headers);
+    final responseHeaders = _entries(response.headers);
     final previewable =
         _builder.captureResponseBody &&
         CorynApiRequestBuilder.isPreviewableBody(response.headers['content-type'], _encodings(response.headers));
@@ -76,10 +83,10 @@ class CorynHttpClient extends http.BaseClient {
       method: request.method,
       duration: duration,
       startedAt: startedAt,
-      requestHeaders: _entries(request.headers),
+      requestHeaders: requestHeaders,
       requestBody: requestBody,
       responseCode: response.statusCode,
-      responseHeaders: _entries(response.headers),
+      responseHeaders: responseHeaders,
       responseBody: body,
       isResponseBodyTruncated: isTruncated,
       isResponseBodyTruncationUnknown: isUnknown,
@@ -93,15 +100,19 @@ class CorynHttpClient extends http.BaseClient {
     void reportOnce({bool isUnknown = false}) {
       if (isReported) return;
       isReported = true;
-      _emit(() => build(body: preview.text, isTruncated: preview.isTruncated, isUnknown: isUnknown));
+      _emit(() {
+        final (:text, :isTruncated) = preview.result;
+        return build(body: text, isTruncated: isTruncated, isUnknown: isUnknown);
+      });
     }
 
-    // The app's bytes and errors are forwarded first and unchanged; the preview only copies bounded data.
+    // The app's bytes and errors are forwarded unchanged. The preview copies its bounded part of a chunk before the app
+    // gets it, so an app changing the chunk in place cannot change the report.
     final stream = response.stream.transform(
       StreamTransformer<List<int>, List<int>>.fromHandlers(
         handleData: (List<int> data, EventSink<List<int>> sink) {
-          sink.add(data);
           preview.add(data);
+          sink.add(data);
           if (preview.isFull) reportOnce();
         },
         handleError: (Object error, StackTrace stack, EventSink<List<int>> sink) {
@@ -114,6 +125,19 @@ class CorynHttpClient extends http.BaseClient {
         },
       ),
     );
+    if (response case http.BaseResponseWithUrl(:final url)) {
+      return _StreamedResponseWithUrl(
+        stream,
+        response.statusCode,
+        url: url,
+        contentLength: response.contentLength,
+        request: response.request,
+        headers: response.headers,
+        isRedirect: response.isRedirect,
+        persistentConnection: response.persistentConnection,
+        reasonPhrase: response.reasonPhrase,
+      );
+    }
     return http.StreamedResponse(
       stream,
       response.statusCode,
@@ -126,23 +150,53 @@ class CorynHttpClient extends http.BaseClient {
     );
   }
 
-  /// Diagnostics never break the app's request: building, transforming and reporting failures are swallowed.
+  /// Diagnostics never break the app's request. A failure to build the report is the SDK's and goes to the native
+  /// error reporting; a failing [transform] or `report` callback, or the request's encoding, is the app's and goes to
+  /// [FlutterError.reportError] once per client.
   void _emit(CorynApiRequest Function() build) {
+    final CorynApiRequest request;
     try {
       if (!Coryn.isRecording) return;
-      final request = build();
+      request = build();
+    } catch (error, stack) {
+      CorynSdkFailures.report('http: report', error, stack);
+      return;
+    }
+    try {
       final transform = this.transform;
       final recorded = transform == null ? request : transform(request);
       if (recorded != null) _report(recorded);
-    } catch (_) {
-      // Ignored on purpose, like the Android interceptor.
+    } catch (error, stack) {
+      _reportCallbackFailure(error, stack);
     }
   }
 
+  void _reportCallbackFailure(Object error, StackTrace stack) {
+    if (_isCallbackFailureReported) return;
+    _isCallbackFailureReported = true;
+    try {
+      FlutterError.reportError(
+        FlutterErrorDetails(
+          exception: error,
+          stack: stack,
+          library: 'coryn_replay_http',
+          context: ErrorDescription('in an app callback or request conversion used by CorynHttpClient'),
+          silent: kReleaseMode,
+        ),
+      );
+    } catch (_) {
+      // A failing app error handler must not replace the transport result.
+    }
+  }
+
+  /// A body its declared encoding cannot decode is not previewed; any other failure is the SDK's.
   String? _safeRequestBody(http.BaseRequest request) {
     try {
       return _requestBody(request);
-    } catch (_) {
+    } on FormatException {
+      return null;
+    } catch (error, stack) {
+      CorynSdkFailures.report('http: request body preview', error, stack);
       return null;
     }
   }
@@ -156,7 +210,16 @@ class CorynHttpClient extends http.BaseClient {
     if (!isPreviewable) return null;
     final isBounded = request.bodyBytes.length <= CorynApiRequestBuilder.maxFieldSize * 4;
     if (!isBounded) return null;
-    final body = request.body;
+    final String body;
+    try {
+      body = request.body;
+    } on FormatException {
+      return null;
+    } catch (error, stack) {
+      // The request's encoding is app code.
+      _reportCallbackFailure(error, stack);
+      return null;
+    }
     return body.length <= CorynApiRequestBuilder.maxFieldSize ? body : null;
   }
 
@@ -172,10 +235,28 @@ class CorynHttpClient extends http.BaseClient {
   void close() => _inner.close();
 }
 
+/// The previewed response keeps the final URL of a redirected response (`package:http` exposes it only this way).
+final class _StreamedResponseWithUrl extends http.StreamedResponse implements http.BaseResponseWithUrl {
+  _StreamedResponseWithUrl(
+    super.stream,
+    super.statusCode, {
+    required this.url,
+    super.contentLength,
+    super.request,
+    super.headers,
+    super.isRedirect,
+    super.persistentConnection,
+    super.reasonPhrase,
+  });
+
+  @override
+  final Uri url;
+}
+
 /// Keeps the first bytes of a textual body (enough for 8,192 characters) and decodes them only when reported, with a
 /// decoder that never throws on malformed or split multi-byte sequences.
 final class _ResponsePreview {
-  _ResponsePreview(String? contentType) : _isLatin1 = _charset(contentType) == 'iso-8859-1';
+  _ResponsePreview(String? contentType) : _isLatin1 = Encoding.getByName(_charset(contentType)) == latin1;
 
   /// UTF-8 needs at most 4 bytes per character.
   static const int _maxBytes = CorynApiRequestBuilder.maxFieldSize * 4;
@@ -187,9 +268,11 @@ final class _ResponsePreview {
   /// Enough bytes were kept, or the body is longer than the preview.
   bool get isFull => _hasMore || _bytes.length >= _maxBytes;
 
-  bool get isTruncated => _hasMore || _decode().length > CorynApiRequestBuilder.maxFieldSize;
-
-  String get text => CorynApiRequestBuilder.preview(_decode()).text;
+  /// The previewed text and whether the body had more, from one decode.
+  ({String text, bool isTruncated}) get result {
+    final preview = CorynApiRequestBuilder.preview(_decode());
+    return (text: preview.text, isTruncated: _hasMore || preview.isTruncated);
+  }
 
   void add(List<int> data) {
     if (isFull) {
@@ -214,6 +297,9 @@ final class _ResponsePreview {
   static String? _charset(String? contentType) {
     if (contentType == null) return null;
     final match = RegExp(r'charset=([^;\s]+)', caseSensitive: false).firstMatch(contentType);
-    return match?.group(1)?.toLowerCase();
+    final charset = match?.group(1)?.toLowerCase();
+    if (charset == null) return null;
+    final isQuoted = charset.length >= 2 && charset.startsWith('"') && charset.endsWith('"');
+    return isQuoted ? charset.substring(1, charset.length - 1) : charset;
   }
 }

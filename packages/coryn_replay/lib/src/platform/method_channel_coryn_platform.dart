@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
@@ -55,10 +54,22 @@ final class MethodChannelCorynPlatform implements CorynPlatform {
       sessionId: status['sessionId'] as String?,
       geometryRevision: status['geometryRevision'] as int? ?? 0,
       isRecordingStopped: status['isRecordingStopped'] as bool? ?? false,
+      // A native side without the surface tracker (before SDK 1.1.132) never reports it: capture as before, not never.
+      isSurfaceLive: status['isSurfaceLive'] as bool? ?? true,
+      isSurfaceFresh: status['isSurfaceFresh'] as bool? ?? false,
     );
   }
 
+  /// Native discards control replies, so a failure is reported here instead of being returned.
   Future<void> _onControl(CorynPlatformListener listener, MethodCall call) async {
+    try {
+      _dispatchControl(listener, call);
+    } catch (error, stack) {
+      listener.reportFailure('control ${call.method}', error, stack);
+    }
+  }
+
+  void _dispatchControl(CorynPlatformListener listener, MethodCall call) {
     final arguments = call.arguments;
     switch (call.method) {
       case 'captureStart':
@@ -76,6 +87,12 @@ final class MethodChannelCorynPlatform implements CorynPlatform {
         listener.onRecordingStarted(map['sessionId']! as String);
       case 'recordingStopped':
         listener.onRecordingStopped();
+      case 'surfaceLive':
+        final map = arguments as Map<Object?, Object?>;
+        listener.onSurfaceLive(map['isLive']! as bool);
+      case 'screenTextRequest':
+        final map = arguments as Map<Object?, Object?>;
+        listener.onScreenTextRequest(map['requestId']! as int);
       default:
         throw MissingPluginException('Unknown Coryn control call ${call.method}');
     }
@@ -103,9 +120,10 @@ final class MethodChannelCorynPlatform implements CorynPlatform {
   }
 
   @override
-  Future<int> registerScreen(String name, Map<String, Object>? arguments) async {
+  Future<int> registerScreen(String name, bool isDialog, Map<String, Object>? arguments) async {
     final handle = await _methods.invokeMethod<int>('registerScreen', <String, Object?>{
       'name': name,
+      'isDialog': isDialog,
       'arguments': arguments,
     });
     return handle!;
@@ -136,6 +154,31 @@ final class MethodChannelCorynPlatform implements CorynPlatform {
   }
 
   @override
+  Future<void> setUserId(String? userId) {
+    return _methods.invokeMethod<void>('setUserId', <String, Object?>{'userId': userId});
+  }
+
+  @override
+  Future<void> sendScreenText(int requestId, List<List<Object>> items) {
+    return _methods.invokeMethod<void>('screenText', <String, Object?>{
+      'generation': _generation,
+      'requestId': requestId,
+      'items': items,
+    });
+  }
+
+  @override
+  Future<void> sendTouch(int action, int actionPointer, List<num> pointers, int eventTimeMs) {
+    return _methods.invokeMethod<void>('touch', <String, Object?>{
+      'generation': _generation,
+      'action': action,
+      'actionPointer': actionPointer,
+      'pointers': pointers,
+      'eventTimeMs': eventTimeMs,
+    });
+  }
+
+  @override
   Future<bool> sendStateBatch(Uint8List batch) async {
     final data = ByteData.sublistView(batch)
       ..setUint32(CorynStateBatchWriter.generationOffset, _generation, Endian.little);
@@ -148,7 +191,8 @@ final class MethodChannelCorynPlatform implements CorynPlatform {
     final data = ByteData.sublistView(header)
       ..setUint32(CorynFrameMessage.generationOffset, _generation, Endian.little);
     // Both messages are queued now, in order, on the same channel; native pairs the pixels with the header before them.
-    unawaited(_frames.send(data));
+    // A failed header send fails the pixel send too, which reports it.
+    _frames.send(data).ignore();
     final reply = await _frames.send(pixels);
     final code = reply == null || reply.lengthInBytes == 0 ? CorynFrameResult.rejected.index : reply.getUint8(0);
     return CorynFrameResult.values[code];
@@ -164,5 +208,14 @@ final class MethodChannelCorynPlatform implements CorynPlatform {
   Future<Map<String, Object?>> debugStats() async {
     final stats = await _methods.invokeMapMethod<String, Object?>('debugStats');
     return stats ?? const <String, Object?>{};
+  }
+
+  @override
+  Future<void> reportFailure(String reason, String? type, String? stacktrace) {
+    return _methods.invokeMethod<void>('reportFailure', <String, Object?>{
+      'reason': reason,
+      'type': type,
+      'stacktrace': stacktrace,
+    });
   }
 }

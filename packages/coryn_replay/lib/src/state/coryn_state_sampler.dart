@@ -4,11 +4,13 @@ import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 
+import '../errors/coryn_app_errors.dart';
+import '../errors/coryn_failure_reporter.dart';
 import 'coryn_state.dart';
 import 'coryn_state_batch.dart';
 
-/// Receives encoded state batches.
-abstract interface class CorynStateBatchSink {
+/// Receives encoded state batches, and the sampler's own failures.
+abstract interface class CorynStateBatchSink implements CorynFailureReporter {
   /// Completes with `true` once native applied the batch.
   Future<bool> sendStateBatch(Uint8List batch);
 }
@@ -209,7 +211,7 @@ final class CorynStateSampler {
     try {
       provider.onProviderRemove();
     } catch (error, stack) {
-      FlutterError.reportError(
+      presentAppError(
         FlutterErrorDetails(
           exception: error,
           stack: stack,
@@ -253,36 +255,65 @@ final class CorynStateSampler {
   }
 
   /// Samples every provider once and sends the changes when no batch is in flight. Public for tests and benchmarks.
+  ///
+  /// The providers are read from a copy: one that registers or removes providers while it is read (against the
+  /// contract) cannot break the tick, and a provider replaced or removed meanwhile is skipped.
   void tick() {
-    final stopwatch = Stopwatch()..start();
-    final time = now();
-    for (final MapEntry<String, _ProviderEntry>(key: stateId, value: entry) in _entries.entries) {
-      if (time < entry.nextReadAt) continue;
-      _sample(stateId, entry, time);
+    try {
+      final stopwatch = Stopwatch()..start();
+      final time = now();
+      for (final MapEntry<String, _ProviderEntry>(key: stateId, value: entry) in _entries.entries.toList()) {
+        if (time < entry.nextReadAt || !_isCurrent(stateId, entry)) continue;
+        _sample(stateId, entry, time);
+      }
+      _sampleTime += stopwatch.elapsed;
+      _flush();
+      if (_entries.isEmpty && _pending.isEmpty) _cancel();
+    } catch (error, stack) {
+      _sink.reportFailure('states: tick', error, stack);
     }
-    _sampleTime += stopwatch.elapsed;
-    _flush();
-    if (_entries.isEmpty && _pending.isEmpty) _cancel();
   }
 
+  bool _isCurrent(String stateId, _ProviderEntry entry) => identical(_entries[stateId], entry);
+
+  /// `getState` and `==` are app code: a failure is the provider's, like native provider failures.
   void _sample(String stateId, _ProviderEntry entry, Duration now) {
     final CorynState? state;
     try {
       state = entry.provider.getState();
     } catch (error, stack) {
-      final backoff = failureBackoff[math.min(entry.failureCount, failureBackoff.length - 1)];
-      entry.failureCount++;
-      entry.nextReadAt = now + backoff;
-      _markFailed(stateId, entry, 'getState threw ${error.runtimeType}', error, stack);
+      _onProviderFailure(stateId, entry, now, 'getState threw ${error.runtimeType}', error, stack);
       return;
     }
-    entry.failureCount = 0;
     final baseline = entry.baseline;
     final isComparable = baseline is! _Unsent && baseline is! _Failed;
-    final isUnchanged = identical(state, baseline) || (isComparable && state == baseline);
+    final bool isUnchanged;
+    try {
+      isUnchanged = identical(state, baseline) || (isComparable && state == baseline);
+    } catch (error, stack) {
+      _onProviderFailure(stateId, entry, now, '== threw ${error.runtimeType}', error, stack);
+      return;
+    }
+    if (!_isCurrent(stateId, entry)) return;
+    entry.failureCount = 0;
     if (isUnchanged) return;
     entry.baseline = state;
     _pending[stateId] = state == null ? const _MissingOperation() : _ValueOperation(state);
+  }
+
+  void _onProviderFailure(
+    String stateId,
+    _ProviderEntry entry,
+    Duration now,
+    String message,
+    Object error,
+    StackTrace stack,
+  ) {
+    if (!_isCurrent(stateId, entry)) return;
+    final backoff = failureBackoff[math.min(entry.failureCount, failureBackoff.length - 1)];
+    entry.failureCount++;
+    entry.nextReadAt = now + backoff;
+    _markFailed(stateId, entry, message, error, stack);
   }
 
   void _markFailed(String stateId, _ProviderEntry entry, String message, Object error, StackTrace stack) {
@@ -297,7 +328,7 @@ final class CorynStateSampler {
   void _report(String stateId, _ProviderEntry entry, String message, Object? error, StackTrace? stack) {
     if (entry.isFailureReported) return;
     entry.isFailureReported = true;
-    FlutterError.reportError(
+    presentAppError(
       FlutterErrorDetails(
         exception: error ?? StateError(message),
         stack: stack,
@@ -315,10 +346,12 @@ final class CorynStateSampler {
     final sent = <String, _Operation>{};
     final sentJson = <String, Uint8List>{};
     for (final stateId in _pending.keys.toList(growable: false)) {
-      final operation = _pending[stateId]!;
+      final operation = _pending[stateId];
+      if (operation == null) continue;
       final result = _write(writer, stateId, operation, sentJson);
       if (result == _WriteResult.full) break;
-      _pending.remove(stateId);
+      // `toJson` is app code and may have queued a newer operation for this key; that one waits for the next batch.
+      if (identical(_pending[stateId], operation)) _pending.remove(stateId);
       if (result == _WriteResult.written) sent[stateId] = operation;
     }
     _encodeTime += stopwatch.elapsed;
@@ -331,9 +364,22 @@ final class CorynStateSampler {
     _sink
         .sendStateBatch(batch)
         .then(
-          (bool isApplied) => _onSent(sent, sentJson, isApplied),
-          onError: (Object _) => _onSent(sent, sentJson, false),
+          (bool isApplied) => _completeSend(sent, sentJson, isApplied),
+          onError: (Object error, StackTrace stack) {
+            _sink.reportFailure('states: batch send', error, stack);
+            _completeSend(sent, sentJson, false);
+          },
         );
+  }
+
+  /// Runs after the tick that sent the batch returned, so its own failures are caught here.
+  void _completeSend(Map<String, _Operation> sent, Map<String, Uint8List> sentJson, bool isApplied) {
+    try {
+      _onSent(sent, sentJson, isApplied);
+    } catch (error, stack) {
+      _isInFlight = false;
+      _sink.reportFailure('states: batch completion', error, stack);
+    }
   }
 
   /// Appends [operation] unless it would make a non-empty batch exceed [maxBatchBytes], or skips a put whose JSON
@@ -348,6 +394,7 @@ final class CorynStateSampler {
     switch (operation) {
       case _ValueOperation(:final state):
         final (json, failure) = _encode(stateId, state);
+        if (!identical(_pending[stateId], operation)) return _WriteResult.unchanged;
         if (json != null) {
           final nativeJson = _nativeJson[stateId];
           if (nativeJson != null && listEquals(nativeJson, json)) return _WriteResult.unchanged;
@@ -422,6 +469,11 @@ final class CorynStateSampler {
         }
       }
     }
-    _flush();
+    // A rejected batch is retried on the next sampling tick, not at channel speed.
+    if (isApplied) {
+      _flush();
+    } else {
+      _schedule();
+    }
   }
 }

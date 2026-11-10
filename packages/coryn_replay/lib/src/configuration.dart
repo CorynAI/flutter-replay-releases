@@ -30,6 +30,7 @@ final class CorynConfiguration {
     this.logViewerIndicatorVisibility,
     this.logViewerIndicatorPaddingTop,
     this.logViewerIndicatorPaddingRight,
+    this.includeErrorMessages = false,
   });
 
   /// Base API URL for self-hosted deployments. Leave `null` for the Coryn cloud.
@@ -49,6 +50,10 @@ final class CorynConfiguration {
   /// Extra right padding of the Log Viewer indicator, in dp.
   final int? logViewerIndicatorPaddingRight;
 
+  /// Whether recorded uncaught Dart errors include their message (truncated), which can contain user data. Defaults to
+  /// `false`. Dart-side: the first Dart `Coryn.init` of the engine decides it, even after a native `Coryn.init`.
+  final bool includeErrorMessages;
+
   Map<String, Object?> toMap() => <String, Object?>{
     'networkBaseUrl': networkBaseUrl,
     'isUploadOnMeteredNetworkAllowed': isUploadOnMeteredNetworkAllowed,
@@ -59,34 +64,48 @@ final class CorynConfiguration {
   };
 }
 
+/// What a recording captures from the UI. Mirrors the Android `CorynUiCapturing`.
+///
+/// Content inside `CorynHide` is left out of both screen text and visuals. The backend can only lower it: when UI
+/// capturing is disabled remotely, neither text nor visuals are captured. Touches are recorded only with visuals.
+enum CorynUiCapturing {
+  /// Nothing is captured from the UI: no screen text, no visuals and no touches.
+  disabled('DISABLED'),
+
+  /// Only the text visible on screen is captured.
+  onlyText('ONLY_TEXT'),
+
+  /// The text visible on screen, UI captures (visuals) and touches are captured.
+  textAndVisuals('TEXT_AND_VISUALS');
+
+  const CorynUiCapturing(this.nativeName);
+
+  /// Name of the Android enum constant.
+  final String nativeName;
+}
+
 /// Recording configuration passed to `Coryn.startRecording`. Mirrors the Android `CorynRecordingConfiguration`.
 final class CorynRecordingConfiguration {
-  const CorynRecordingConfiguration({this.isUiCapturingEnabled, this.memoryLeakCodePackages = const <String>{}});
+  const CorynRecordingConfiguration({this.uiCapturing, this.memoryLeakCodePackages = const <String>{}});
 
-  /// Whether UI captures are recorded. `null` keeps the SDK default (enabled unless disabled remotely).
-  final bool? isUiCapturingEnabled;
+  /// What is captured from the UI. `null` keeps the SDK default, [CorynUiCapturing.disabled]: hide private content with
+  /// `CorynHide` before enabling it.
+  final CorynUiCapturing? uiCapturing;
 
   /// Kotlin/Java packages whose objects count as app code for native memory-leak reports.
   final Set<String> memoryLeakCodePackages;
 
   Map<String, Object?> toMap() => <String, Object?>{
-    'isUiCapturingEnabled': isUiCapturingEnabled,
+    'uiCapturing': uiCapturing?.nativeName,
     'memoryLeakCodePackages': memoryLeakCodePackages.toList(),
   };
 }
 
-/// Dart-side capture options. They change how Flutter frames are captured and masked.
+/// Dart-side capture options. They change how Flutter frames are masked; the capture rate comes from the backend.
 final class CorynCaptureOptions {
-  const CorynCaptureOptions({
-    this.maskObscuredText = true,
-    this.minCaptureInterval = const Duration(milliseconds: 200),
-  });
+  const CorynCaptureOptions({this.maskObscuredText = true});
 
   /// Masks every text field with `obscureText` even without `CorynHide`, by masking its nearest repaint boundary.
   /// Defaults to `true`.
   final bool maskObscuredText;
-
-  /// Shortest time between two captures while the UI keeps changing (the native capture rate is "as fast as the
-  /// pipeline allows"). Larger values lower the cost during animations. Defaults to 200 ms.
-  final Duration minCaptureInterval;
 }

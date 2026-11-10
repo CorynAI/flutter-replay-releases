@@ -8,18 +8,26 @@ import '../internal/coryn_runtime.dart';
 /// successful Dart `Coryn.init`, if it was not unregistered meanwhile, so a late init (for example after consent) still
 /// records the screen the user is on.
 final class CorynScreenRegistration {
-  CorynScreenRegistration._(this.name, this._arguments, this._runtime);
+  CorynScreenRegistration._(this.name, this.isDialog, this._arguments, this._runtime);
 
   /// Registers [name] (no-op on unsupported platforms).
-  static CorynScreenRegistration register(CorynRuntime runtime, String name, Map<String, Object>? arguments) {
-    if (!runtime.platform.isSupported) return CorynScreenRegistration._(name, arguments, null);
+  static CorynScreenRegistration register(
+    CorynRuntime runtime,
+    String name,
+    bool isDialog,
+    Map<String, Object>? arguments,
+  ) {
+    if (!runtime.platform.isSupported) return CorynScreenRegistration._(name, isDialog, arguments, null);
     _checkArguments(arguments);
-    final registration = CorynScreenRegistration._(name, arguments, runtime);
+    final registration = CorynScreenRegistration._(name, isDialog, arguments, runtime);
     registration._handle = registration._register(runtime);
     return registration;
   }
 
   final String name;
+
+  /// Whether the screen is a dialog or a bottom sheet shown above another screen.
+  final bool isDialog;
   final Map<String, Object>? _arguments;
   final CorynRuntime? _runtime;
 
@@ -32,9 +40,9 @@ final class CorynScreenRegistration {
   Future<int?> _register(CorynRuntime runtime) async {
     try {
       if (!await runtime.ensureAttached()) return null;
-      return await runtime.platform.registerScreen(name, _arguments);
-    } catch (error) {
-      runtime.logFailureOnce('registerScreen', error);
+      return await runtime.platform.registerScreen(name, isDialog, _arguments);
+    } catch (error, stack) {
+      runtime.reportCallFailure('registerScreen', error, stack);
       runtime.registerAfterInit(this);
       return null;
     }
@@ -62,8 +70,8 @@ final class CorynScreenRegistration {
     if (handle == null) return;
     try {
       await runtime.platform.unregisterScreen(handle);
-    } catch (error) {
-      runtime.logFailureOnce('unregisterScreen', error);
+    } catch (error, stack) {
+      runtime.reportCallFailure('unregisterScreen', error, stack);
     }
   }
 

@@ -14,7 +14,7 @@ class CorynRoot extends SingleChildRenderObjectWidget {
 
   @override
   RenderCorynRoot createRenderObject(BuildContext context) {
-    CorynRuntime.instance.ensureAttached();
+    CorynRuntime.instance.attachInBackground();
     return RenderCorynRoot(flutterView: View.of(context));
   }
 

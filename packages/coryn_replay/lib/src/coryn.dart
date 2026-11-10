@@ -5,6 +5,8 @@ import 'package:flutter/foundation.dart';
 
 import 'capture/coryn_capture_stats.dart';
 import 'configuration.dart';
+import 'errors/coryn_app_errors.dart';
+import 'errors/coryn_error_reporter.dart';
 import 'internal/coryn_runtime.dart';
 import 'network/coryn_api_request.dart';
 import 'screens/coryn_screen_registration.dart';
@@ -22,6 +24,11 @@ abstract final class Coryn {
 
   /// Initialises the SDK with [apiKey]. The first `init` in a process wins, including a native `Coryn.init` in
   /// `Application.onCreate` (recommended: it also covers crashes before the Flutter engine starts).
+  ///
+  /// It also records uncaught Dart errors as `FlutterError` events by chaining `FlutterError.onError` and
+  /// `PlatformDispatcher.instance.onError`; call it after other error reporters set theirs. Messages are recorded only
+  /// with [CorynConfiguration.includeErrorMessages]. At most 10 errors are recorded in each one-second window; all of
+  /// them still reach the previous handlers.
   static Future<void> init(
     String apiKey, {
     CorynConfiguration? configuration,
@@ -29,7 +36,8 @@ abstract final class Coryn {
   }) async {
     _runtime.capture.options = captureOptions;
     if (!await _runtime.ensureAttached()) return;
-    await _runtime.platform.init(apiKey, configuration);
+    CorynErrorReporter.install(includeMessages: configuration?.includeErrorMessages ?? false);
+    await _runtime.reportingFailures('init', () => _runtime.platform.init(apiKey, configuration));
     _runtime.onInitialized();
   }
 
@@ -40,18 +48,33 @@ abstract final class Coryn {
     CorynRecordingConfiguration? configuration,
     void Function(String sessionId)? onRecordingStarted,
   }) async {
-    if (onRecordingStarted != null) _runtime.addSessionListener(onRecordingStarted);
     if (!await _runtime.ensureAttached()) return;
-    await _runtime.platform.startRecording(delayReason, configuration);
+    if (onRecordingStarted != null) _runtime.addSessionListener(onRecordingStarted);
+    await _runtime.reportingFailures(
+      'startRecording',
+      () => _runtime.platform.startRecording(delayReason, configuration),
+    );
   }
 
   /// Stops recording; what was recorded is kept. Recording cannot be restarted in this process (native contract).
   static Future<void> stopRecording([String? reason]) async {
     try {
-      if (await _runtime.ensureAttached()) await _runtime.platform.stopRecording(reason);
+      if (await _runtime.ensureAttached()) {
+        await _runtime.reportingFailures('stopRecording', () => _runtime.platform.stopRecording(reason));
+      }
     } finally {
       _runtime.onStopRequested();
     }
+  }
+
+  /// Sets the ID of the signed-in user of your app, so that the recordings of one person can be found and erased on
+  /// request. Pass an internal account ID, not an email, phone number or name, and `null` when the user signs out.
+  ///
+  /// Every recording lists the user ID set when it started and every other distinct user ID set while it was recorded.
+  /// Setting the same ID again does nothing. More than 10 distinct user IDs in one recording cancel the recording.
+  static void setUserId(String? userId) {
+    if (!isSupported) return;
+    unawaited(_call('setUserId', () => _runtime.platform.setUserId(userId)));
   }
 
   /// Id of the current native session, once it started.
@@ -61,21 +84,22 @@ abstract final class Coryn {
   /// isolate). HTTP integrations skip all work while it is `false`, like the Android OkHttp interceptor.
   static bool get isRecording {
     if (!isSupported) return false;
-    unawaited(_runtime.ensureAttached());
+    _runtime.attachInBackground();
     return _runtime.sessionId != null;
   }
 
   /// Registers a screen until [CorynScreenRegistration.unregister]. Prefer `CorynNavigatorObserver` or `CorynScreen`.
   ///
+  /// [isDialog] tells whether the screen is a dialog or a bottom sheet shown above another screen.
   /// [arguments] values must be `String`, `num` or `bool`; they are recorded as-is, so never pass private data.
-  static CorynScreenRegistration registerScreen(String name, {Map<String, Object>? arguments}) {
-    return CorynScreenRegistration.register(_runtime, name, arguments);
+  static CorynScreenRegistration registerScreen(String name, {required bool isDialog, Map<String, Object>? arguments}) {
+    return CorynScreenRegistration.register(_runtime, name, isDialog, arguments);
   }
 
   /// Adds (or replaces) the provider of [stateId]. Call [removeState] when it is no longer valid.
   static void provideState(String stateId, CorynStateProvider<CorynState> provider) {
     if (!isSupported) return;
-    unawaited(_runtime.ensureAttached());
+    _runtime.attachInBackground();
     _runtime.sampler.provide(stateId, provider);
   }
 
@@ -89,8 +113,15 @@ abstract final class Coryn {
   /// Adds an event, optionally with a [state]. [timePassed] says how long ago it happened.
   static void addEvent(String eventId, {CorynState? state, Duration timePassed = Duration.zero}) {
     if (!isSupported) return;
+    // Native dates the event when the call arrives, which may wait for attach.
+    final sinceCall = Stopwatch()..start();
     final stateJson = state == null ? null : _encodeEventState(eventId, state);
-    unawaited(_call('addEvent', () => _runtime.platform.addEvent(eventId, stateJson, timePassed.inMilliseconds)));
+    unawaited(
+      _call('addEvent', () {
+        final timePassedMs = (timePassed + sinceCall.elapsed).inMilliseconds;
+        return _runtime.platform.addEvent(eventId, stateJson, timePassedMs);
+      }),
+    );
   }
 
   /// Reports a completed HTTP request. UI hiding does not mask these fields; see [CorynApiRequest].
@@ -112,14 +143,14 @@ abstract final class Coryn {
   /// Native bridge counters for diagnostics and benchmarks.
   static Future<Map<String, Object?>> debugStats() async {
     if (!await _runtime.ensureAttached()) return const <String, Object?>{};
-    return _runtime.platform.debugStats();
+    return _runtime.reportingFailures('debugStats', _runtime.platform.debugStats);
   }
 
   static String? _encodeEventState(String eventId, CorynState state) {
     try {
       return jsonEncode(state.toJson());
     } catch (error, stack) {
-      FlutterError.reportError(
+      presentAppError(
         FlutterErrorDetails(
           exception: error,
           stack: stack,
@@ -136,8 +167,8 @@ abstract final class Coryn {
   static Future<void> _call(String name, Future<void> Function() action) async {
     try {
       if (await _runtime.ensureAttached()) await action();
-    } catch (error) {
-      _runtime.logFailureOnce(name, error);
+    } catch (error, stack) {
+      _runtime.reportCallFailure(name, error, stack);
     }
   }
 }

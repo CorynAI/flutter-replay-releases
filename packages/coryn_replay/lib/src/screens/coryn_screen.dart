@@ -6,9 +6,12 @@ import 'coryn_screen_registration.dart';
 /// Records [name] as a screen while this widget is mounted. Use it for navigation that `CorynNavigatorObserver`
 /// cannot see (tabs, custom routers).
 class CorynScreen extends StatefulWidget {
-  const CorynScreen({super.key, required this.name, this.arguments, required this.child});
+  const CorynScreen({super.key, required this.name, required this.isDialog, this.arguments, required this.child});
 
   final String name;
+
+  /// Whether the screen is a dialog or a bottom sheet shown above another screen.
+  final bool isDialog;
 
   /// `String`/`num`/`bool` values recorded with the screen. Never pass private data.
   final Map<String, Object>? arguments;
@@ -30,14 +33,15 @@ class _CorynScreenState extends State<CorynScreen> {
   @override
   void didUpdateWidget(CorynScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
-    final isChanged = oldWidget.name != widget.name || !_sameArguments(oldWidget.arguments, widget.arguments);
+    final isSameScreen = oldWidget.name == widget.name && oldWidget.isDialog == widget.isDialog;
+    final isChanged = !isSameScreen || !_sameArguments(oldWidget.arguments, widget.arguments);
     if (!isChanged) return;
     _registration?.unregister();
     _register();
   }
 
   void _register() {
-    _registration = Coryn.registerScreen(widget.name, arguments: widget.arguments);
+    _registration = Coryn.registerScreen(widget.name, isDialog: widget.isDialog, arguments: widget.arguments);
   }
 
   static bool _sameArguments(Map<String, Object>? a, Map<String, Object>? b) {

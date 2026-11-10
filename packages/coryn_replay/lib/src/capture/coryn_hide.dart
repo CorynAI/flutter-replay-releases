@@ -12,8 +12,18 @@ import 'package:flutter/widgets.dart';
 ///
 /// Content painted by widgets outside this subtree is not hidden: put `CorynHide` inside a `Hero` (not around it), and
 /// hide routes (dialogs, `DropdownButton` menus), overlay entries or custom painters that show the same data elsewhere.
+///
+/// Screen text inside it is never recorded. Touches inside it (including [padding]) are recorded only with
+/// [allowTouchRecording]: otherwise a touch that starts in or moves into it is not recorded until it ends, so typing
+/// on a custom PIN pad cannot be reconstructed.
 class CorynHide extends SingleChildRenderObjectWidget {
-  const CorynHide({super.key, this.hide = true, this.padding = EdgeInsets.zero, required Widget super.child});
+  const CorynHide({
+    super.key,
+    this.hide = true,
+    this.padding = EdgeInsets.zero,
+    this.allowTouchRecording = false,
+    required Widget super.child,
+  });
 
   /// Whether hiding is enabled.
   final bool hide;
@@ -21,25 +31,45 @@ class CorynHide extends SingleChildRenderObjectWidget {
   /// Extra hidden area around [child], in logical pixels.
   final EdgeInsets padding;
 
+  /// Whether touches inside the hidden area are recorded. Defaults to `false`.
+  final bool allowTouchRecording;
+
   @override
-  RenderCorynHide createRenderObject(BuildContext context) => RenderCorynHide(hide: hide, padding: padding);
+  RenderCorynHide createRenderObject(BuildContext context) {
+    return RenderCorynHide(hide: hide, padding: padding, allowTouchRecording: allowTouchRecording);
+  }
 
   @override
   void updateRenderObject(BuildContext context, RenderCorynHide renderObject) {
     renderObject
       ..hide = hide
-      ..padding = padding;
+      ..padding = padding
+      ..allowTouchRecording = allowTouchRecording;
   }
 }
 
 /// Render object of [CorynHide]. Always a repaint boundary, so everything its subtree paints lives in its own layer,
 /// which the capture replaces with a black rectangle.
 class RenderCorynHide extends RenderProxyBox {
-  RenderCorynHide({required bool hide, required EdgeInsets padding})
+  RenderCorynHide({required bool hide, required EdgeInsets padding, required bool allowTouchRecording})
     // ignore: prefer_initializing_formals
     : _hide = hide,
       // ignore: prefer_initializing_formals
-      _padding = padding;
+      _padding = padding,
+      // ignore: prefer_initializing_formals
+      _allowTouchRecording = allowTouchRecording;
+
+  /// Whether touches inside [maskRect] are recorded. A change schedules a frame, which updates the touch regions.
+  bool get allowTouchRecording => _allowTouchRecording;
+  bool _allowTouchRecording;
+  set allowTouchRecording(bool value) {
+    if (_allowTouchRecording == value) return;
+    _allowTouchRecording = value;
+    markNeedsPaint();
+  }
+
+  /// Whether this object currently blocks touch recording.
+  bool get isTouchBlocking => hide && !allowTouchRecording;
 
   /// Attached render objects; the capture looks up their layers.
   static final Set<RenderCorynHide> attachedHides = <RenderCorynHide>{};

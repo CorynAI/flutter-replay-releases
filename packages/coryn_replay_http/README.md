@@ -11,12 +11,12 @@ dependencies:
     git:
       url: https://github.com/CorynAI/flutter-replay-releases.git
       path: packages/coryn_replay
-      ref: v0.1.0
+      ref: v0.2.0
   coryn_replay_http:
     git:
       url: https://github.com/CorynAI/flutter-replay-releases.git
       path: packages/coryn_replay_http
-      ref: v0.1.0
+      ref: v0.2.0
 ```
 
 ```dart

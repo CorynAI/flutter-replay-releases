@@ -1,8 +1,8 @@
 group = "ai.coryn.replay.flutter"
-version = "0.1.0"
+version = "0.2.0"
 
 /** The plugin's Android code: the obfuscated Coryn Android SDK module `ai.coryn.replay.internal:flutter`; only the entry point is here. **/
-val corynAndroidSdkVersion = "1.1.131"
+val corynAndroidSdkVersion = "1.1.134"
 
 buildscript {
     val kotlinVersion = "2.4.0"

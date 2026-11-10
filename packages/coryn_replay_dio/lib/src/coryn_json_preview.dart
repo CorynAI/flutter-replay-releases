@@ -1,8 +1,9 @@
 import 'package:coryn_replay/coryn_replay.dart';
 
-/// JSON of decoded Dio data (`Map`, `List`, `String`, `num`, `bool`, `null`, objects with `toJson`), as
-/// `jsonEncode` writes it but only up to [CorynApiRequestBuilder.maxFieldSize] characters: a large body, a long string
-/// or a wide map costs no more than the preview. `null` when the data is not JSON-encodable.
+/// JSON of plain JSON data (`Map`, `List`, `String`, `num`, `bool`, `null`), as `jsonEncode` writes it but only up to
+/// [CorynApiRequestBuilder.maxFieldSize] characters: a large body, a long string or a wide map costs no more than the
+/// preview. `null` when it meets anything else, also objects with `toJson`: app code is never called, so the preview
+/// cannot change what Dio encodes afterwards.
 ({String text, bool isTruncated})? jsonPreview(Object? data) {
   final writer = _JsonPreviewWriter();
   try {
@@ -29,9 +30,7 @@ final class _JsonPreviewWriter {
     if (_buffer.length > CorynApiRequestBuilder.maxFieldSize) throw const _PreviewFull();
   }
 
-  /// Writes [value]; an object that is not JSON gets one `toJson()` conversion, whose result must be JSON (its children
-  /// may be converted again), as in `jsonEncode`.
-  void write(Object? value, {bool isConverted = false}) {
+  void write(Object? value) {
     _checkFull();
     switch (value) {
       case null:
@@ -63,9 +62,7 @@ final class _JsonPreviewWriter {
         }
         _buffer.write('}');
       default:
-        if (isConverted) throw UnsupportedError('toJson() did not return JSON');
-        final Object? json = (value as dynamic).toJson();
-        write(json, isConverted: true);
+        throw UnsupportedError('Not plain JSON');
     }
     _checkFull();
   }

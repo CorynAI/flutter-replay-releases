@@ -1,6 +1,6 @@
 name: coryn_replay_http
 description: Records package:http requests as Coryn API request events, with the same redaction rules as the Coryn Android OkHttp interceptor.
-version: 0.1.0
+version: 0.2.0
 publish_to: none
 
 environment:
@@ -16,7 +16,7 @@ dependencies:
     git:
       url: https://github.com/CorynAI/flutter-replay-releases.git
       path: packages/coryn_replay
-      ref: v0.1.0
+      ref: v0.2.0
   http: ^1.5.0
 
 dev_dependencies:
